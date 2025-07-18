@@ -32,6 +32,7 @@ mod request_body;
 mod response;
 mod row;
 mod rowbinary;
+mod summary_header;
 #[cfg(feature = "inserter")]
 mod ticks;
 
@@ -311,6 +312,12 @@ impl Client {
     /// Starts a new SELECT/DDL query.
     pub fn query(&self, query: &str) -> query::Query {
         query::Query::new(self, query)
+    }
+
+    /// Starts a new SELECT/DDL query, with the `wait_end_of_query` setting enabled
+    /// to buffer the full query results on the server
+    pub fn query_buffered(&self, query: &str) -> query::Query {
+        query::Query::new_buffered(self, query)
     }
 
     /// Starts a new WATCH query.
