@@ -22,54 +22,108 @@ use crate::compression::lz4::Lz4Decoder;
 use crate::{
     compression::Compression,
     error::{Error, Result},
+    summary_header::Summary,
 };
+
+use tracing::{Instrument, Span};
 
 // === Response ===
 
 pub(crate) enum Response {
     // Headers haven't been received yet.
     // `Box<_>` improves performance by reducing the size of the whole future.
-    Waiting(ResponseFuture),
+    Waiting(ResponseFuture, Span),
     // Headers have been received, streaming the body.
-    Loading(Chunks),
+    Loading(Chunks, Span),
 }
 
 pub(crate) type ResponseFuture = Pin<Box<dyn Future<Output = Result<Chunks>> + Send>>;
 
 impl Response {
-    pub(crate) fn new(response: HyperResponseFuture, compression: Compression) -> Self {
-        Self::Waiting(Box::pin(async move {
-            let response = response.await?;
-            let status = response.status();
-            let body = response.into_body();
+    pub(crate) fn new(response: HyperResponseFuture, compression: Compression, span: Span) -> Self {
+        let inner_span = span.clone();
+        Self::Waiting(
+            Box::pin(async move {
+                let response = response.await?;
+                let status = response.status();
+                if let Some(summary_header) = response.headers().get("x-clickhouse-summary") {
+                    match serde_json::from_slice::<Summary>(summary_header.as_bytes()) {
+                        Ok(summary_header) => {
+                            if let Some(rows) = summary_header.result_rows {
+                                inner_span.record("db.response.returned_rows", rows);
+                            }
+                            if let Some(rows) = summary_header.read_rows {
+                                inner_span.record("db.response.read_rows", rows);
+                            }
+                            if let Some(rows) = summary_header.written_rows {
+                                inner_span.record("db.response.written_rows", rows);
+                            }
+                            if let Some(bytes) = summary_header.read_bytes {
+                                inner_span.record("db.response.read_bytes", bytes);
+                            }
+                            if let Some(bytes) = summary_header.written_bytes {
+                                inner_span.record("db.response.written_bytes", bytes);
+                            }
+                            tracing::trace!(
+                                read_rows = summary_header.read_rows,
+                                read_bytes = summary_header.read_bytes,
+                                written_rows = summary_header.written_bytes,
+                                written_bytes = summary_header.written_rows,
+                                total_rows_to_read = summary_header.total_rows_to_read,
+                                result_rows = summary_header.result_rows,
+                                result_bytes = summary_header.result_bytes,
+                                elapsed_ns = summary_header.elapsed_ns,
+                                "finished processing query"
+                            )
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "invalid x-clickhouse-summary header returned: {:?}, {:?}",
+                                e,
+                                summary_header
+                            );
+                        }
+                    }
+                }
+                let body = response.into_body();
 
-            if status == StatusCode::OK {
-                // More likely to be successful, start streaming.
-                // It still can fail, but we'll handle it in `DetectDbException`.
-                Ok(Chunks::new(body, compression))
-            } else {
-                // An instantly failed request.
-                Err(collect_bad_response(status, body, compression).await)
-            }
-        }))
+                inner_span.record("status", status.as_u16());
+
+                if status == StatusCode::OK {
+                    inner_span.record("otel.status_code", "OK");
+                    // More likely to be successful, start streaming.
+                    // It still can fail, but we'll handle it in `DetectDbException`.
+                    Ok(Chunks::new(body, compression))
+                } else {
+                    inner_span.record("otel.status_code", "ERROR");
+                    // An instantly failed request.
+                    Err(collect_bad_response(status, body, compression)
+                        .instrument(inner_span)
+                        .await)
+                }
+            }),
+            span,
+        )
     }
 
     pub(crate) fn into_future(self) -> ResponseFuture {
         match self {
-            Self::Waiting(future) => future,
-            Self::Loading(_) => panic!("response is already streaming"),
+            Self::Waiting(future, span) => Box::pin(future.instrument(span)),
+            Self::Loading(_, _) => panic!("response is already streaming"),
         }
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
-        let chunks = loop {
+        let (chunks, span) = loop {
             match self {
-                Self::Waiting(future) => *self = Self::Loading(future.await?),
-                Self::Loading(chunks) => break chunks,
+                Self::Waiting(future, span) => {
+                    *self = Self::Loading(future.instrument(span.clone()).await?, span.clone())
+                }
+                Self::Loading(chunks, span) => break (chunks, span),
             }
         };
 
-        while chunks.try_next().await?.is_some() {}
+        while chunks.try_next().instrument(span.clone()).await?.is_some() {}
         Ok(())
     }
 }
