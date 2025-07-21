@@ -93,7 +93,7 @@ impl Response {
                     inner_span.record("otel.status_code", "OK");
                     // More likely to be successful, start streaming.
                     // It still can fail, but we'll handle it in `DetectDbException`.
-                    Ok(Chunks::new(body, compression))
+                    Ok(Chunks::new(body, compression, inner_span))
                 } else {
                     inner_span.record("otel.status_code", "ERROR");
                     // An instantly failed request.
@@ -195,23 +195,32 @@ pub(crate) struct Chunk {
 
 // * Uses `Option<_>` to make this stream fused.
 // * Uses `Box<_>` in order to reduce the size of cursors.
-pub(crate) struct Chunks(Option<Box<DetectDbException<Decompress<IncomingStream>>>>);
+pub(crate) struct Chunks {
+    stream: Option<Box<DetectDbException<Decompress<IncomingStream>>>>,
+    span: Option<Span>,
+}
 
 impl Chunks {
-    fn new(stream: Incoming, compression: Compression) -> Self {
+    fn new(stream: Incoming, compression: Compression, span: Span) -> Self {
         let stream = IncomingStream(stream);
         let stream = Decompress::new(stream, compression);
         let stream = DetectDbException(stream);
-        Self(Some(Box::new(stream)))
+        Self {
+            stream: Some(Box::new(stream)),
+            span: Some(span),
+        }
     }
 
     pub(crate) fn empty() -> Self {
-        Self(None)
+        Self {
+            stream: None,
+            span: None,
+        }
     }
 
     #[cfg(feature = "futures03")]
     pub(crate) fn is_terminated(&self) -> bool {
-        self.0.is_none()
+        self.stream.is_none()
     }
 }
 
@@ -219,16 +228,19 @@ impl Stream for Chunks {
     type Item = Result<Chunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let guard = self.span.take().map(|s| s.entered());
         // We use `take()` to make the stream fused, including the case of panics.
-        if let Some(mut stream) = self.0.take() {
+        if let Some(mut stream) = self.stream.take() {
             let res = Pin::new(&mut stream).poll_next(cx);
 
             if matches!(res, Poll::Pending | Poll::Ready(Some(Ok(_)))) {
-                self.0 = Some(stream);
+                self.stream = Some(stream);
+                self.span = guard.map(|g| g.exit());
             }
 
             res
         } else {
+            self.span = guard.map(|g| g.exit());
             Poll::Ready(None)
         }
     }
