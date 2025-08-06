@@ -78,9 +78,9 @@ impl Response {
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "invalid x-clickhouse-summary header returned: {:?}, {:?}",
-                                e,
-                                summary_header
+                                error = &e as &dyn std::error::Error,
+                                ?summary_header,
+                                "invalid x-clickhouse-summary header returned",
                             );
                         }
                     }
