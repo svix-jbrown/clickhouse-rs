@@ -160,6 +160,7 @@ impl Query {
     }
 
     pub(crate) fn do_execute(self, read_only: bool) -> Result<Response> {
+        let query_formatted = format!("{}", self.sql_display());
         let query = self.sql.finish()?;
 
         let execution_span = tracing::debug_span!(
@@ -168,7 +169,7 @@ impl Query {
             otel.status_code = tracing::field::Empty,
             otel.kind = "CLIENT",
             db.system.name = "clickhouse",
-            db.query.text = query,
+            db.query.text = query_formatted,
             db.response.returned_rows = tracing::field::Empty,
             db.response.read_bytes = tracing::field::Empty,
             db.response.read_rows = tracing::field::Empty,
