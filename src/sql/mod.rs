@@ -1,4 +1,4 @@
-use std::fmt::{self, Display, Write};
+use std::fmt::{self, Display};
 
 use crate::{
     error::{Error, Result},
@@ -13,7 +13,11 @@ pub(crate) mod ser;
 
 #[derive(Debug, Clone)]
 pub(crate) enum SqlBuilder {
-    InProgress(Vec<Part>, Option<String>),
+    InProgress {
+        template: String,
+        parts: Vec<Part>,
+        format_opt: Option<String>,
+    },
     Failed(String),
 }
 
@@ -28,15 +32,13 @@ pub(crate) enum Part {
 impl fmt::Display for SqlBuilder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SqlBuilder::InProgress(parts, output_format_opt) => {
-                for part in parts {
-                    match part {
-                        Part::Arg => f.write_char('?')?,
-                        Part::Fields => f.write_str("?fields")?,
-                        Part::Text(text) => f.write_str(text)?,
-                    }
-                }
-                if let Some(output_format) = output_format_opt {
+            SqlBuilder::InProgress {
+                template,
+                format_opt,
+                ..
+            } => {
+                f.write_str(template)?;
+                if let Some(output_format) = format_opt {
                     f.write_str(&format!(" FORMAT {output_format}"))?
                 }
             }
@@ -49,6 +51,7 @@ impl fmt::Display for SqlBuilder {
 impl SqlBuilder {
     pub(crate) fn new(template: &str) -> Self {
         let mut parts = Vec::new();
+        let owned_template = String::from(template);
         let mut rest = template;
         while let Some(idx) = rest.find('?') {
             if rest[idx + 1..].starts_with('?') {
@@ -72,17 +75,21 @@ impl SqlBuilder {
             parts.push(Part::Text(rest.to_string()));
         }
 
-        SqlBuilder::InProgress(parts, None)
+        SqlBuilder::InProgress {
+            parts,
+            template: owned_template,
+            format_opt: None,
+        }
     }
 
     pub(crate) fn set_output_format(&mut self, format: impl Into<String>) {
-        if let Self::InProgress(_, format_opt) = self {
+        if let Self::InProgress { format_opt, .. } = self {
             *format_opt = Some(format.into());
         }
     }
 
     pub(crate) fn bind_arg(&mut self, value: impl Bind) {
-        let Self::InProgress(parts, _) = self else {
+        let Self::InProgress { parts, .. } = self else {
             return;
         };
 
@@ -100,7 +107,7 @@ impl SqlBuilder {
     }
 
     pub(crate) fn bind_fields<T: Row>(&mut self) {
-        let Self::InProgress(parts, _) = self else {
+        let Self::InProgress { parts, .. } = self else {
             return;
         };
 
@@ -116,7 +123,7 @@ impl SqlBuilder {
     pub(crate) fn finish(mut self) -> Result<String> {
         let mut sql = String::new();
 
-        if let Self::InProgress(parts, _) = &self {
+        if let Self::InProgress { parts, .. } = &self {
             for part in parts {
                 match part {
                     Part::Text(text) => sql.push_str(text),
@@ -133,8 +140,8 @@ impl SqlBuilder {
         }
 
         match self {
-            Self::InProgress(_, output_format_opt) => {
-                if let Some(output_format) = output_format_opt {
+            Self::InProgress { format_opt, .. } => {
+                if let Some(output_format) = format_opt {
                     sql.push_str(&format!(" FORMAT {output_format}"))
                 }
                 Ok(sql)
