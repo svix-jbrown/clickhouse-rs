@@ -333,7 +333,7 @@ impl<T> Insert<T> {
         debug_assert!(matches!(self.state, InsertState::NotStarted { .. }));
         let (client, sql) = self.state.client_with_sql().unwrap(); // checked above
 
-        let span = tracing::debug_span!(
+        let span = tracing::info_span!(
             "clickhouse.insert",
             status = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
