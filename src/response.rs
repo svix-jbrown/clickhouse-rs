@@ -22,54 +22,108 @@ use crate::compression::lz4::Lz4Decoder;
 use crate::{
     compression::Compression,
     error::{Error, Result},
+    summary_header::Summary,
 };
+
+use tracing::{Instrument, Span};
 
 // === Response ===
 
 pub(crate) enum Response {
     // Headers haven't been received yet.
     // `Box<_>` improves performance by reducing the size of the whole future.
-    Waiting(ResponseFuture),
+    Waiting(ResponseFuture, Span),
     // Headers have been received, streaming the body.
-    Loading(Chunks),
+    Loading(Chunks, Span),
 }
 
 pub(crate) type ResponseFuture = Pin<Box<dyn Future<Output = Result<Chunks>> + Send>>;
 
 impl Response {
-    pub(crate) fn new(response: HyperResponseFuture, compression: Compression) -> Self {
-        Self::Waiting(Box::pin(async move {
-            let response = response.await?;
-            let status = response.status();
-            let body = response.into_body();
+    pub(crate) fn new(response: HyperResponseFuture, compression: Compression, span: Span) -> Self {
+        let inner_span = span.clone();
+        Self::Waiting(
+            Box::pin(async move {
+                let response = response.await?;
+                let status = response.status();
+                if let Some(summary_header) = response.headers().get("x-clickhouse-summary") {
+                    match serde_json::from_slice::<Summary>(summary_header.as_bytes()) {
+                        Ok(summary_header) => {
+                            if let Some(rows) = summary_header.result_rows {
+                                inner_span.record("db.response.returned_rows", rows);
+                            }
+                            if let Some(rows) = summary_header.read_rows {
+                                inner_span.record("db.response.read_rows", rows);
+                            }
+                            if let Some(rows) = summary_header.written_rows {
+                                inner_span.record("db.response.written_rows", rows);
+                            }
+                            if let Some(bytes) = summary_header.read_bytes {
+                                inner_span.record("db.response.read_bytes", bytes);
+                            }
+                            if let Some(bytes) = summary_header.written_bytes {
+                                inner_span.record("db.response.written_bytes", bytes);
+                            }
+                            tracing::debug!(
+                                read_rows = summary_header.read_rows,
+                                read_bytes = summary_header.read_bytes,
+                                written_rows = summary_header.written_bytes,
+                                written_bytes = summary_header.written_rows,
+                                total_rows_to_read = summary_header.total_rows_to_read,
+                                result_rows = summary_header.result_rows,
+                                result_bytes = summary_header.result_bytes,
+                                elapsed_ns = summary_header.elapsed_ns,
+                                "finished processing query"
+                            )
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = &e as &dyn std::error::Error,
+                                ?summary_header,
+                                "invalid x-clickhouse-summary header returned",
+                            );
+                        }
+                    }
+                }
+                let body = response.into_body();
 
-            if status == StatusCode::OK {
-                // More likely to be successful, start streaming.
-                // It still can fail, but we'll handle it in `DetectDbException`.
-                Ok(Chunks::new(body, compression))
-            } else {
-                // An instantly failed request.
-                Err(collect_bad_response(status, body, compression).await)
-            }
-        }))
+                inner_span.record("status", status.as_u16());
+
+                if status == StatusCode::OK {
+                    inner_span.record("otel.status_code", "OK");
+                    // More likely to be successful, start streaming.
+                    // It still can fail, but we'll handle it in `DetectDbException`.
+                    Ok(Chunks::new(body, compression, inner_span))
+                } else {
+                    inner_span.record("otel.status_code", "ERROR");
+                    // An instantly failed request.
+                    Err(collect_bad_response(status, body, compression)
+                        .instrument(inner_span)
+                        .await)
+                }
+            }),
+            span,
+        )
     }
 
     pub(crate) fn into_future(self) -> ResponseFuture {
         match self {
-            Self::Waiting(future) => future,
-            Self::Loading(_) => panic!("response is already streaming"),
+            Self::Waiting(future, span) => Box::pin(future.instrument(span)),
+            Self::Loading(_, _) => panic!("response is already streaming"),
         }
     }
 
     pub(crate) async fn finish(&mut self) -> Result<()> {
-        let chunks = loop {
+        let (chunks, span) = loop {
             match self {
-                Self::Waiting(future) => *self = Self::Loading(future.await?),
-                Self::Loading(chunks) => break chunks,
+                Self::Waiting(future, span) => {
+                    *self = Self::Loading(future.instrument(span.clone()).await?, span.clone())
+                }
+                Self::Loading(chunks, span) => break (chunks, span),
             }
         };
 
-        while chunks.try_next().await?.is_some() {}
+        while chunks.try_next().instrument(span.clone()).await?.is_some() {}
         Ok(())
     }
 }
@@ -141,23 +195,32 @@ pub(crate) struct Chunk {
 
 // * Uses `Option<_>` to make this stream fused.
 // * Uses `Box<_>` in order to reduce the size of cursors.
-pub(crate) struct Chunks(Option<Box<DetectDbException<Decompress<IncomingStream>>>>);
+pub(crate) struct Chunks {
+    stream: Option<Box<DetectDbException<Decompress<IncomingStream>>>>,
+    span: Option<Span>,
+}
 
 impl Chunks {
-    fn new(stream: Incoming, compression: Compression) -> Self {
+    fn new(stream: Incoming, compression: Compression, span: Span) -> Self {
         let stream = IncomingStream(stream);
         let stream = Decompress::new(stream, compression);
         let stream = DetectDbException(stream);
-        Self(Some(Box::new(stream)))
+        Self {
+            stream: Some(Box::new(stream)),
+            span: Some(span),
+        }
     }
 
     pub(crate) fn empty() -> Self {
-        Self(None)
+        Self {
+            stream: None,
+            span: None,
+        }
     }
 
     #[cfg(feature = "futures03")]
     pub(crate) fn is_terminated(&self) -> bool {
-        self.0.is_none()
+        self.stream.is_none()
     }
 }
 
@@ -165,16 +228,19 @@ impl Stream for Chunks {
     type Item = Result<Chunk>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let guard = self.span.take().map(|s| s.entered());
         // We use `take()` to make the stream fused, including the case of panics.
-        if let Some(mut stream) = self.0.take() {
+        if let Some(mut stream) = self.stream.take() {
             let res = Pin::new(&mut stream).poll_next(cx);
 
             if matches!(res, Poll::Pending | Poll::Ready(Some(Ok(_)))) {
-                self.0 = Some(stream);
+                self.stream = Some(stream);
+                self.span = guard.map(|g| g.exit());
             }
 
             res
         } else {
+            self.span = guard.map(|g| g.exit());
             Poll::Ready(None)
         }
     }
