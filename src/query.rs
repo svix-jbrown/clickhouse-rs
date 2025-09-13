@@ -157,7 +157,7 @@ impl Query {
         let query_formatted = format!("{}", self.sql_display());
         let query = self.sql.finish()?;
 
-        let execution_span = tracing::debug_span!(
+        let execution_span = tracing::info_span!(
             "clickhouse.query",
             status = tracing::field::Empty,
             otel.status_code = tracing::field::Empty,
