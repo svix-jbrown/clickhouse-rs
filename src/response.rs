@@ -64,7 +64,7 @@ impl Response {
                             if let Some(bytes) = summary_header.written_bytes {
                                 inner_span.record("db.response.written_bytes", bytes);
                             }
-                            tracing::trace!(
+                            tracing::debug!(
                                 read_rows = summary_header.read_rows,
                                 read_bytes = summary_header.read_bytes,
                                 written_rows = summary_header.written_bytes,
